@@ -1,0 +1,27 @@
+{
+  "fase": 3,
+  "estado": "COMPLETADA",
+  "fecha_scoring": "2026-07-10",
+  "clientes_elegibles_mt": 13650,
+  "ofertas_mt_evaluadas": 3,
+  "canales_evaluados": [
+    "Call In",
+    "Call Out",
+    "Digital",
+    "Tienda"
+  ],
+  "combinaciones_evaluadas": 163800,
+  "top3_filas": 40950,
+  "recomendaciones_finales": 13650,
+  "modelo_propension_base": "Logistic Regression",
+  "ranker_operativo": "HistGradientBoosting",
+  "ranker_test_auc_general": 0.5878291659396575,
+  "ranker_test_pr_auc_general": 0.49085392974644143,
+  "ranker_test_auc_elegible_mt": 0.6776135583942408,
+  "ranker_test_pr_auc_elegible_mt": 0.7043744661111193,
+  "score_nbo_promedio": 0.7836314367740521,
+  "score_nbo_mediano": 0.8049576141702866,
+  "ofertas_recomendadas_distintas": 3,
+  "canales_recomendados_distintos": 4,
+  "nota_metodologica": "La Regresión Logística se conserva como benchmark de propensión. Para escoger oferta y canal se usa un ranker no lineal porque la estructura aditiva del modelo lineal no generó suficiente diversidad de NBO entre clientes."
+}
