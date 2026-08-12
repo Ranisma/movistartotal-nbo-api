@@ -64,14 +64,16 @@ def listar_recomendaciones(
     departamento: str | None = None,
     search: str | None = None,
     solo_incremento: bool = False,
+    rango_incremento: str = "desde_10",
     sort_by: str = "score_nbo",
     descending: bool = True,
 ):
     """Cola comercial Movistar Total.
 
     Este endpoint se mantiene restringido al universo elegible MT.
-    `solo_incremento=true` filtra clientes cuya recomendación principal
-    implicaría un pago mensual mayor que su situación actual equivalente.
+    `solo_incremento=true` activa el filtro económico. `rango_incremento`
+    admite: cualquiera, menos_10, desde_10, desde_20 o desde_40.
+    Por defecto usa desde_10.
     """
     total, items = get_repository().list_recommendations(
         limit=limit,
@@ -83,6 +85,7 @@ def listar_recomendaciones(
         departamento=departamento,
         search=search,
         solo_incremento=solo_incremento,
+        rango_incremento=rango_incremento,
         sort_by=sort_by,
         descending=descending,
     )
@@ -91,6 +94,7 @@ def listar_recomendaciones(
         "limit": limit,
         "offset": offset,
         "solo_incremento": solo_incremento,
+        "rango_incremento": rango_incremento if solo_incremento else None,
         "items": items,
     }
 
@@ -103,13 +107,15 @@ def listar_clientes_universo(
     elegible_mt: bool | None = None,
     tipo_cliente: str | None = None,
     solo_incremento: bool = False,
+    rango_incremento: str = "desde_10",
     sort_by: str = "score_nbo_mt",
     descending: bool = True,
 ):
     """Vista Clientes: top comercial por defecto y búsqueda universal.
 
     - Sin `search`: devuelve elegibles MT ordenados por Score NBO descendente.
-    - Sin `search` + `solo_incremento=true`: mismo ranking, solo con incremento.
+    - Sin `search` + `solo_incremento=true`: mismo ranking, refinado por
+      `rango_incremento` (cualquiera, menos_10, desde_10, desde_20, desde_40).
     - Con `search`: busca en los 100k clientes, aunque no sean aptos MT o ya
       tengan MT. En búsqueda, `solo_incremento` no bloquea la coincidencia.
     """
@@ -120,6 +126,7 @@ def listar_clientes_universo(
         elegible_mt=elegible_mt,
         tipo_cliente=tipo_cliente,
         solo_incremento=solo_incremento,
+        rango_incremento=rango_incremento,
         sort_by=sort_by,
         descending=descending,
     )
@@ -128,6 +135,7 @@ def listar_clientes_universo(
         "limit": limit,
         "offset": offset,
         "solo_incremento": solo_incremento,
+        "rango_incremento": rango_incremento if solo_incremento else None,
         "items": items,
     }
 

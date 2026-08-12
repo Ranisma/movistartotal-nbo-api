@@ -7,7 +7,7 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-from .config import DATA_DIR
+from .config import DATA_DIR, DEFAULT_RANGO_INCREMENTO, RANGOS_INCREMENTO
 
 
 def _clean_value(v):
@@ -24,6 +24,28 @@ def _clean_value(v):
 
 def _record_clean(record: dict) -> dict:
     return {k: _clean_value(v) for k, v in record.items()}
+
+
+def _normalizar_rango_incremento(rango: Optional[str]) -> str:
+    value = str(rango or DEFAULT_RANGO_INCREMENTO).strip().lower()
+    return value if value in RANGOS_INCREMENTO else DEFAULT_RANGO_INCREMENTO
+
+
+def _mask_rango_incremento(variacion: pd.Series, rango: Optional[str]) -> pd.Series:
+    """Devuelve la máscara del rango solicitado sobre variación mensual positiva."""
+    values = pd.to_numeric(variacion, errors="coerce").fillna(0).round(2)
+    selected = _normalizar_rango_incremento(rango)
+
+    if selected == "cualquiera":
+        return values > 0
+    if selected == "menos_10":
+        return (values > 0) & (values < 10)
+    if selected == "desde_20":
+        return values >= 20
+    if selected == "desde_40":
+        return values >= 40
+    # Default: desde_10
+    return values >= 10
 
 
 class NBORepository:
@@ -95,7 +117,11 @@ class NBORepository:
                 np.where(elegible, "Apto MT", "No apto MT"),
             )
 
-            variacion = pd.to_numeric(df.get("variacion_mensual"), errors="coerce").fillna(0)
+            variacion = pd.to_numeric(
+                df.get("variacion_mensual"), errors="coerce"
+            ).fillna(0).round(2)
+            # Indicador técnico: cualquier variación positiva. El rango comercial
+            # se decide dinámicamente en cada consulta.
             df["incremento_precio"] = variacion > 0
 
             self._decisiones = df.set_index("cliente_id", drop=False)
@@ -109,6 +135,7 @@ class NBORepository:
         elegible_mt: Optional[bool] = None,
         tipo_cliente: Optional[str] = None,
         solo_incremento: bool = False,
+        rango_incremento: str = DEFAULT_RANGO_INCREMENTO,
         sort_by: str = "score_nbo_mt",
         descending: bool = True,
     ) -> tuple[int, list[dict]]:
@@ -116,8 +143,7 @@ class NBORepository:
 
         Comportamiento intencional:
         - Sin `search`: muestra SOLO clientes elegibles MT, ordenados por Score NBO
-          de mayor a menor. Si `solo_incremento=true`, además exige que la
-          recomendación principal aumente el pago mensual.
+          de mayor a menor. Si `solo_incremento=true`, aplica `rango_incremento`.
         - Con `search`: busca en los 100k clientes, incluso si no son aptos MT,
           ya tienen MT o no tienen incremento. La búsqueda universal tiene
           prioridad sobre el switch `solo_incremento`.
@@ -176,7 +202,7 @@ class NBORepository:
                 ]
 
             if solo_incremento:
-                df = df[df["incremento_precio"] == True]  # noqa: E712
+                df = df[_mask_rango_incremento(df["variacion_mensual"], rango_incremento)]
 
             # En la vista por defecto SIEMPRE manda el Score NBO.
             if "score_nbo_mt" in df.columns:
@@ -296,6 +322,7 @@ class NBORepository:
         departamento: Optional[str] = None,
         search: Optional[str] = None,
         solo_incremento: bool = False,
+        rango_incremento: str = DEFAULT_RANGO_INCREMENTO,
         sort_by: str = "score_nbo",
         descending: bool = True,
     ) -> tuple[int, list[dict]]:
@@ -324,14 +351,15 @@ class NBORepository:
             ]
 
         if solo_incremento:
-            # Fuente única para el filtro económico: la capa universal ya contiene
+            # Fuente única para el filtro económico: la capa universal contiene
             # la variación mensual equivalente para cada cliente elegible MT.
             decisiones = self._load_decisiones()
-            positivos = decisiones[
-                decisiones["elegible_mt"].fillna(False).astype(bool)
-                & decisiones["incremento_precio"]
-            ].index
-            df = df[df["cliente_id"].isin(positivos)]
+            elegibles = decisiones["elegible_mt"].fillna(False).astype(bool)
+            rango_mask = _mask_rango_incremento(
+                decisiones["variacion_mensual"], rango_incremento
+            )
+            ids_filtrados = decisiones[elegibles & rango_mask].index
+            df = df[df["cliente_id"].isin(ids_filtrados)]
 
         allowed_sort = {
             "score_nbo",
