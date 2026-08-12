@@ -25,7 +25,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-repo = get_repository()
+# El repositorio se carga de forma diferida.
+# Esto permite que Uvicorn abra el puerto inmediatamente en Render
+# y evita que la lectura de CSVs bloquee el port scan del despliegue.
 
 
 @app.get("/", tags=["Sistema"])
@@ -44,13 +46,12 @@ def health():
     return {
         "status": "ok",
         "api_version": API_VERSION,
-        "recomendaciones_cargadas": len(repo.recomendaciones),
     }
 
 
 @app.get("/api/v1/info", tags=["Sistema"])
 def info():
-    return repo.resumen
+    return get_repository().resumen
 
 
 @app.get("/api/v1/recomendaciones", tags=["Recomendaciones"])
@@ -66,7 +67,7 @@ def listar_recomendaciones(
     sort_by: str = "score_nbo",
     descending: bool = True,
 ):
-    total, items = repo.list_recommendations(
+    total, items = get_repository().list_recommendations(
         limit=limit,
         offset=offset,
         prioridad=prioridad,
@@ -88,7 +89,7 @@ def listar_recomendaciones(
 
 @app.get("/api/v1/clientes/{cliente_id}", tags=["Clientes"])
 def cliente_360(cliente_id: str):
-    result = repo.get_client360(cliente_id)
+    result = get_repository().get_client360(cliente_id)
     if result is None:
         raise HTTPException(
             status_code=404,
@@ -99,7 +100,7 @@ def cliente_360(cliente_id: str):
 
 @app.get("/api/v1/clientes/{cliente_id}/recomendacion", tags=["Clientes"])
 def recomendacion_cliente(cliente_id: str):
-    result = repo.get_recommendation(cliente_id)
+    result = get_repository().get_recommendation(cliente_id)
     if result is None:
         raise HTTPException(
             status_code=404,
@@ -110,7 +111,7 @@ def recomendacion_cliente(cliente_id: str):
 
 @app.get("/api/v1/clientes/{cliente_id}/top3", tags=["Clientes"])
 def top3_cliente(cliente_id: str):
-    result = repo.get_top3(cliente_id)
+    result = get_repository().get_top3(cliente_id)
     if not result:
         raise HTTPException(
             status_code=404,
@@ -124,14 +125,14 @@ def top3_cliente(cliente_id: str):
 
 @app.get("/api/v1/ofertas/resumen", tags=["Analytics"])
 def resumen_ofertas():
-    return repo.summary_offers()
+    return get_repository().summary_offers()
 
 
 @app.get("/api/v1/canales/resumen", tags=["Analytics"])
 def resumen_canales():
-    return repo.summary_channels()
+    return get_repository().summary_channels()
 
 
 @app.get("/api/v1/prioridades/resumen", tags=["Analytics"])
 def resumen_prioridades():
-    return repo.summary_priorities()
+    return get_repository().summary_priorities()
