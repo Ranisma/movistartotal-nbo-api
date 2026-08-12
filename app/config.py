@@ -5,11 +5,10 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
 
 API_TITLE = "Movistar Total — NBO Intelligence API"
-API_VERSION = "1.1.0"
+API_VERSION = "1.2.0"
 API_DESCRIPTION = (
-    "API pública de consulta para el motor Next Best Offer de Movistar Total. "
-    "Expone clientes elegibles, recomendaciones, Top 3 de ofertas, "
-    "resúmenes y métricas del motor NBO."
+    "API pública para el motor Next Best Offer de Movistar Total y la capa "
+    "Next Best Decision para consulta universal de clientes."
 )
 
 def allowed_origins():

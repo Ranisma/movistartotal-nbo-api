@@ -28,6 +28,7 @@ def _record_clean(record: dict) -> dict:
 
 class NBORepository:
     def __init__(self):
+        # Mantiene intacto el universo comercial actual de elegibles MT.
         self.recomendaciones = pd.read_csv(DATA_DIR / "fase_3_recomendaciones_nbo.csv")
         self.top3 = pd.read_csv(DATA_DIR / "fase_3_top3_por_cliente.csv")
         self.resumen_ofertas = pd.read_csv(DATA_DIR / "fase_3_resumen_ofertas.csv")
@@ -37,9 +38,28 @@ class NBORepository:
         with open(DATA_DIR / "fase_3_resumen.json", "r", encoding="utf-8") as f:
             self.resumen = json.load(f)
 
-        # Índice lógico de recomendación por cliente.
         self.recomendaciones["cliente_id"] = self.recomendaciones["cliente_id"].astype(str)
         self.top3["cliente_id"] = self.top3["cliente_id"].astype(str)
+
+        # La capa universal (100k clientes) se carga SOLO cuando se consulta.
+        self._decisiones = None
+
+    def _load_decisiones(self):
+        if self._decisiones is None:
+            df = pd.read_csv(DATA_DIR / "decisiones_cliente.csv.gz")
+            df["cliente_id"] = df["cliente_id"].astype(str)
+            self._decisiones = df.set_index("cliente_id", drop=False)
+        return self._decisiones
+
+    def get_client_decision(self, cliente_id: str) -> Optional[dict]:
+        df = self._load_decisiones()
+        key = str(cliente_id)
+        if key not in df.index:
+            return None
+        row = df.loc[key]
+        if isinstance(row, pd.DataFrame):
+            row = row.iloc[0]
+        return _record_clean(row.to_dict())
 
     def get_recommendation(self, cliente_id: str) -> Optional[dict]:
         rows = self.recomendaciones[self.recomendaciones["cliente_id"] == str(cliente_id)]

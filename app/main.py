@@ -25,9 +25,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# El repositorio se carga de forma diferida.
-# Esto permite que Uvicorn abra el puerto inmediatamente en Render
-# y evita que la lectura de CSVs bloquee el port scan del despliegue.
+# Importante para Render: el repositorio NO se carga al importar el módulo.
+# Así Uvicorn puede abrir el puerto inmediatamente.
 
 
 @app.get("/", tags=["Sistema"])
@@ -87,6 +86,17 @@ def listar_recomendaciones(
     }
 
 
+@app.get("/api/v1/clientes/{cliente_id}/decision", tags=["Clientes"])
+def decision_cliente(cliente_id: str):
+    result = get_repository().get_client_decision(cliente_id)
+    if result is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Cliente no encontrado en la base de clientes."
+        )
+    return result
+
+
 @app.get("/api/v1/clientes/{cliente_id}", tags=["Clientes"])
 def cliente_360(cliente_id: str):
     result = get_repository().get_client360(cliente_id)
@@ -104,7 +114,7 @@ def recomendacion_cliente(cliente_id: str):
     if result is None:
         raise HTTPException(
             status_code=404,
-            detail="No existe recomendación NBO para este cliente."
+            detail="No existe recomendación NBO MT para este cliente."
         )
     return result
 
@@ -115,7 +125,7 @@ def top3_cliente(cliente_id: str):
     if not result:
         raise HTTPException(
             status_code=404,
-            detail="No existen alternativas NBO para este cliente."
+            detail="No existen alternativas NBO MT para este cliente."
         )
     return {
         "cliente_id": cliente_id,
