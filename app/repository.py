@@ -28,7 +28,7 @@ def _record_clean(record: dict) -> dict:
 
 class NBORepository:
     def __init__(self):
-        # Mantiene intacto el universo comercial actual de elegibles MT.
+        # Se mantiene intacto el universo comercial actual de elegibles MT.
         self.recomendaciones = pd.read_csv(DATA_DIR / "fase_3_recomendaciones_nbo.csv")
         self.top3 = pd.read_csv(DATA_DIR / "fase_3_top3_por_cliente.csv")
         self.resumen_ofertas = pd.read_csv(DATA_DIR / "fase_3_resumen_ofertas.csv")
@@ -48,8 +48,156 @@ class NBORepository:
         if self._decisiones is None:
             df = pd.read_csv(DATA_DIR / "decisiones_cliente.csv.gz")
             df["cliente_id"] = df["cliente_id"].astype(str)
+
+            # Prioridad comercial MT real para quienes sí están en la cola NBO.
+            priority_map = (
+                self.recomendaciones[["cliente_id", "prioridad"]]
+                .drop_duplicates("cliente_id")
+                .set_index("cliente_id")["prioridad"]
+                if "prioridad" in self.recomendaciones.columns
+                else pd.Series(dtype="object")
+            )
+
+            score_map = (
+                self.recomendaciones[["cliente_id", "score_nbo"]]
+                .drop_duplicates("cliente_id")
+                .set_index("cliente_id")["score_nbo"]
+                if "score_nbo" in self.recomendaciones.columns
+                else pd.Series(dtype="float64")
+            )
+
+            df["prioridad_mt"] = df["cliente_id"].map(priority_map)
+            df["score_nbo_mt"] = df["cliente_id"].map(score_map)
+
+            elegible = df.get("elegible_mt", False)
+            if not isinstance(elegible, pd.Series):
+                elegible = pd.Series(False, index=df.index)
+            elegible = elegible.fillna(False).astype(bool)
+
+            ya_tiene = df.get("es_movistar_total", False)
+            if not isinstance(ya_tiene, pd.Series):
+                ya_tiene = pd.Series(False, index=df.index)
+            ya_tiene = ya_tiene.fillna(False).astype(bool)
+
+            df["prioridad_cliente"] = np.where(
+                ya_tiene,
+                "Ya tiene MT",
+                np.where(
+                    elegible,
+                    df["prioridad_mt"].fillna("Elegible MT"),
+                    "No apto MT",
+                ),
+            )
+
+            df["estado_mt"] = np.where(
+                ya_tiene,
+                "Ya tiene MT",
+                np.where(elegible, "Apto MT", "No apto MT"),
+            )
+
+            variacion = pd.to_numeric(df.get("variacion_mensual"), errors="coerce").fillna(0)
+            df["incremento_precio"] = variacion > 0
+
             self._decisiones = df.set_index("cliente_id", drop=False)
         return self._decisiones
+
+    def list_client_decisions(
+        self,
+        limit: int = 50,
+        offset: int = 0,
+        search: Optional[str] = None,
+        elegible_mt: Optional[bool] = None,
+        tipo_cliente: Optional[str] = None,
+        solo_incremento: bool = False,
+        sort_by: str = "cliente_id",
+        descending: bool = False,
+    ) -> tuple[int, list[dict]]:
+        """Lista paginada del universo completo de clientes.
+
+        Este listado NO altera /api/v1/recomendaciones: la cola comercial MT
+        sigue conteniendo solamente oportunidades elegibles para Movistar Total.
+        """
+        df = self._load_decisiones().reset_index(drop=True)
+
+        if search:
+            q = str(search).strip().lower()
+            if q:
+                df = df[
+                    df["cliente_id"]
+                    .astype(str)
+                    .str.lower()
+                    .str.contains(q, na=False, regex=False)
+                ]
+
+        if elegible_mt is not None and "elegible_mt" in df.columns:
+            df = df[df["elegible_mt"].fillna(False).astype(bool) == bool(elegible_mt)]
+
+        if tipo_cliente and "tipo_cliente" in df.columns:
+            df = df[
+                df["tipo_cliente"]
+                .astype(str)
+                .str.lower()
+                .eq(str(tipo_cliente).lower())
+            ]
+
+        if solo_incremento:
+            df = df[df["incremento_precio"] == True]  # noqa: E712
+
+        allowed_sort = {
+            "cliente_id",
+            "tipo_cliente",
+            "antiguedad_meses",
+            "total_actual",
+            "elegible_mt",
+            "prioridad_cliente",
+            "oferta_recomendada",
+            "decision_tipo",
+            "variacion_mensual",
+        }
+        if sort_by not in allowed_sort or sort_by not in df.columns:
+            sort_by = "cliente_id"
+
+        df = df.sort_values(sort_by, ascending=not descending, na_position="last")
+        total = len(df)
+        page = df.iloc[offset: offset + limit]
+
+        # La tabla Clientes necesita un resumen ligero, no las 50+ columnas.
+        fields = [
+            "cliente_id",
+            "tipo_cliente",
+            "antiguedad_meses",
+            "ubicacion_departamento",
+            "tiene_movil",
+            "tiene_hogar",
+            "tiene_internet_hogar",
+            "es_movistar_total",
+            "elegible_mt",
+            "estado_mt",
+            "prioridad_cliente",
+            "prioridad_mt",
+            "score_nbo_mt",
+            "motivo_no_elegible_mt",
+            "consumo_datos_gb_prom",
+            "canal_mas_usado",
+            "decision_tipo",
+            "canal_sugerido",
+            "plan_actual_id",
+            "plan_actual_nombre",
+            "total_actual",
+            "oferta_recomendada_id",
+            "oferta_recomendada",
+            "precio_recomendado",
+            "total_con_recomendacion",
+            "variacion_mensual",
+            "incremento_precio",
+            "recomendacion_es_plan_actual",
+            "adecuacion",
+        ]
+        fields = [field for field in fields if field in page.columns]
+        return total, [
+            _record_clean(x)
+            for x in page[fields].to_dict(orient="records")
+        ]
 
     def get_client_decision(self, cliente_id: str) -> Optional[dict]:
         df = self._load_decisiones()
@@ -117,9 +265,11 @@ class NBORepository:
         score_min: Optional[float] = None,
         departamento: Optional[str] = None,
         search: Optional[str] = None,
+        solo_incremento: bool = False,
         sort_by: str = "score_nbo",
         descending: bool = True,
     ) -> tuple[int, list[dict]]:
+        # Importante: este DataFrame sigue siendo SOLO el universo elegible MT.
         df = self.recomendaciones
 
         if prioridad:
@@ -143,6 +293,16 @@ class NBORepository:
                 )
             ]
 
+        if solo_incremento:
+            # Fuente única para el filtro económico: la capa universal ya contiene
+            # la variación mensual equivalente para cada cliente elegible MT.
+            decisiones = self._load_decisiones()
+            positivos = decisiones[
+                decisiones["elegible_mt"].fillna(False).astype(bool)
+                & decisiones["incremento_precio"]
+            ].index
+            df = df[df["cliente_id"].isin(positivos)]
+
         allowed_sort = {
             "score_nbo",
             "cliente_id",
@@ -151,6 +311,7 @@ class NBORepository:
             "canal_recomendado",
             "monto_facturado_prom",
             "antiguedad_meses",
+            "variacion_mensual_servicios",
         }
         if sort_by not in allowed_sort or sort_by not in df.columns:
             sort_by = "score_nbo"

@@ -63,9 +63,16 @@ def listar_recomendaciones(
     score_min: float | None = Query(None, ge=0, le=1),
     departamento: str | None = None,
     search: str | None = None,
+    solo_incremento: bool = False,
     sort_by: str = "score_nbo",
     descending: bool = True,
 ):
+    """Cola comercial Movistar Total.
+
+    Este endpoint se mantiene restringido al universo elegible MT.
+    `solo_incremento=true` filtra clientes cuya recomendación principal
+    implicaría un pago mensual mayor que su situación actual equivalente.
+    """
     total, items = get_repository().list_recommendations(
         limit=limit,
         offset=offset,
@@ -75,6 +82,7 @@ def listar_recomendaciones(
         score_min=score_min,
         departamento=departamento,
         search=search,
+        solo_incremento=solo_incremento,
         sort_by=sort_by,
         descending=descending,
     )
@@ -82,6 +90,45 @@ def listar_recomendaciones(
         "total": total,
         "limit": limit,
         "offset": offset,
+        "solo_incremento": solo_incremento,
+        "items": items,
+    }
+
+
+@app.get("/api/v1/clientes-universo", tags=["Clientes"])
+def listar_clientes_universo(
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    search: str | None = None,
+    elegible_mt: bool | None = None,
+    tipo_cliente: str | None = None,
+    solo_incremento: bool = False,
+    sort_by: str = "cliente_id",
+    descending: bool = False,
+):
+    """Lista paginada del universo completo de clientes.
+
+    - Elegible MT: conserva su prioridad comercial real.
+    - No elegible MT: `prioridad_cliente = "No apto MT"`.
+    - Ya tiene MT: `prioridad_cliente = "Ya tiene MT"`.
+    - `solo_incremento=true`: muestra solo casos cuya mejor decisión
+      aumentaría el pago mensual frente a la situación actual.
+    """
+    total, items = get_repository().list_client_decisions(
+        limit=limit,
+        offset=offset,
+        search=search,
+        elegible_mt=elegible_mt,
+        tipo_cliente=tipo_cliente,
+        solo_incremento=solo_incremento,
+        sort_by=sort_by,
+        descending=descending,
+    )
+    return {
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "solo_incremento": solo_incremento,
         "items": items,
     }
 
