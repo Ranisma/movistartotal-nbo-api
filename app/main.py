@@ -97,22 +97,21 @@ def listar_recomendaciones(
 
 @app.get("/api/v1/clientes-universo", tags=["Clientes"])
 def listar_clientes_universo(
-    limit: int = Query(50, ge=1, le=500),
+    limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
     search: str | None = None,
     elegible_mt: bool | None = None,
     tipo_cliente: str | None = None,
     solo_incremento: bool = False,
-    sort_by: str = "cliente_id",
-    descending: bool = False,
+    sort_by: str = "score_nbo_mt",
+    descending: bool = True,
 ):
-    """Lista paginada del universo completo de clientes.
+    """Vista Clientes: top comercial por defecto y búsqueda universal.
 
-    - Elegible MT: conserva su prioridad comercial real.
-    - No elegible MT: `prioridad_cliente = "No apto MT"`.
-    - Ya tiene MT: `prioridad_cliente = "Ya tiene MT"`.
-    - `solo_incremento=true`: muestra solo casos cuya mejor decisión
-      aumentaría el pago mensual frente a la situación actual.
+    - Sin `search`: devuelve elegibles MT ordenados por Score NBO descendente.
+    - Sin `search` + `solo_incremento=true`: mismo ranking, solo con incremento.
+    - Con `search`: busca en los 100k clientes, aunque no sean aptos MT o ya
+      tengan MT. En búsqueda, `solo_incremento` no bloquea la coincidencia.
     """
     total, items = get_repository().list_client_decisions(
         limit=limit,

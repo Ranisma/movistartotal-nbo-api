@@ -103,61 +103,91 @@ class NBORepository:
 
     def list_client_decisions(
         self,
-        limit: int = 50,
+        limit: int = 100,
         offset: int = 0,
         search: Optional[str] = None,
         elegible_mt: Optional[bool] = None,
         tipo_cliente: Optional[str] = None,
         solo_incremento: bool = False,
-        sort_by: str = "cliente_id",
-        descending: bool = False,
+        sort_by: str = "score_nbo_mt",
+        descending: bool = True,
     ) -> tuple[int, list[dict]]:
-        """Lista paginada del universo completo de clientes.
+        """Vista Clientes: top comercial por defecto + búsqueda universal.
 
-        Este listado NO altera /api/v1/recomendaciones: la cola comercial MT
-        sigue conteniendo solamente oportunidades elegibles para Movistar Total.
+        Comportamiento intencional:
+        - Sin `search`: muestra SOLO clientes elegibles MT, ordenados por Score NBO
+          de mayor a menor. Si `solo_incremento=true`, además exige que la
+          recomendación principal aumente el pago mensual.
+        - Con `search`: busca en los 100k clientes, incluso si no son aptos MT,
+          ya tienen MT o no tienen incremento. La búsqueda universal tiene
+          prioridad sobre el switch `solo_incremento`.
+
+        `/api/v1/recomendaciones` no se modifica y continúa siendo exclusivamente
+        la cola comercial de elegibles Movistar Total.
         """
         df = self._load_decisiones().reset_index(drop=True)
 
-        if search:
-            q = str(search).strip().lower()
-            if q:
-                df = df[
-                    df["cliente_id"]
-                    .astype(str)
-                    .str.lower()
-                    .str.contains(q, na=False, regex=False)
-                ]
+        q = str(search or "").strip().lower()
+        searching = bool(q)
 
-        if elegible_mt is not None and "elegible_mt" in df.columns:
-            df = df[df["elegible_mt"].fillna(False).astype(bool) == bool(elegible_mt)]
-
-        if tipo_cliente and "tipo_cliente" in df.columns:
+        if searching:
+            # Búsqueda universal: cualquier cliente de la base puede aparecer.
             df = df[
-                df["tipo_cliente"]
+                df["cliente_id"]
                 .astype(str)
                 .str.lower()
-                .eq(str(tipo_cliente).lower())
-            ]
+                .str.contains(q, na=False, regex=False)
+            ].copy()
 
-        if solo_incremento:
-            df = df[df["incremento_precio"] == True]  # noqa: E712
+            # Si existe coincidencia exacta, la colocamos primero.
+            df["_exact_search"] = (
+                df["cliente_id"].astype(str).str.lower().eq(q)
+            )
+            df = df.sort_values(
+                ["_exact_search", "cliente_id"],
+                ascending=[False, True],
+                na_position="last",
+            ).drop(columns=["_exact_search"])
 
-        allowed_sort = {
-            "cliente_id",
-            "tipo_cliente",
-            "antiguedad_meses",
-            "total_actual",
-            "elegible_mt",
-            "prioridad_cliente",
-            "oferta_recomendada",
-            "decision_tipo",
-            "variacion_mensual",
-        }
-        if sort_by not in allowed_sort or sort_by not in df.columns:
-            sort_by = "cliente_id"
+            # Importante: NO aplicamos solo_incremento aquí. Esto permite encontrar
+            # a un cliente no apto MT aunque el switch haya quedado activado.
+            if elegible_mt is not None and "elegible_mt" in df.columns:
+                df = df[df["elegible_mt"].fillna(False).astype(bool) == bool(elegible_mt)]
 
-        df = df.sort_values(sort_by, ascending=not descending, na_position="last")
+            if tipo_cliente and "tipo_cliente" in df.columns:
+                df = df[
+                    df["tipo_cliente"]
+                    .astype(str)
+                    .str.lower()
+                    .eq(str(tipo_cliente).lower())
+                ]
+
+        else:
+            # Estado por defecto de Clientes = ranking comercial MT, no los 100k.
+            if "elegible_mt" in df.columns:
+                df = df[df["elegible_mt"].fillna(False).astype(bool)]
+
+            if tipo_cliente and "tipo_cliente" in df.columns:
+                df = df[
+                    df["tipo_cliente"]
+                    .astype(str)
+                    .str.lower()
+                    .eq(str(tipo_cliente).lower())
+                ]
+
+            if solo_incremento:
+                df = df[df["incremento_precio"] == True]  # noqa: E712
+
+            # En la vista por defecto SIEMPRE manda el Score NBO.
+            if "score_nbo_mt" in df.columns:
+                df = df.sort_values(
+                    ["score_nbo_mt", "cliente_id"],
+                    ascending=[False, True],
+                    na_position="last",
+                )
+            else:
+                df = df.sort_values("cliente_id", ascending=True)
+
         total = len(df)
         page = df.iloc[offset: offset + limit]
 
