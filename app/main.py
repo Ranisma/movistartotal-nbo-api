@@ -9,6 +9,7 @@ from .config import (
     allowed_origins,
 )
 from .repository import get_repository
+from .rebate_rules import normalizar_rebates_decision
 
 app = FastAPI(
     title=API_TITLE,
@@ -158,7 +159,7 @@ def decision_cliente(cliente_id: str):
             status_code=404,
             detail="Cliente no encontrado en la base de clientes."
         )
-    return result
+    return normalizar_rebates_decision(result)
 
 
 @app.get("/api/v1/clientes/{cliente_id}/rebates", tags=["Clientes"])
@@ -169,6 +170,7 @@ def rebates_cliente(cliente_id: str):
             status_code=404,
             detail="Cliente no encontrado en la base de clientes."
         )
+    decision = normalizar_rebates_decision(decision)
     return {
         "cliente_id": cliente_id,
         "oferta_principal_id": decision.get("oferta_recomendada_id"),
