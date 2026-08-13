@@ -82,6 +82,39 @@ class NBORepository:
             if catalogo_path.exists()
             else pd.DataFrame()
         )
+
+        # Fallback robusto para Render/GitHub: las 3 ofertas Movistar Total ya
+        # existen en fase_3_top3_por_cliente.csv. Si el catálogo completo no fue
+        # desplegado (o le falta alguno de OF020/OF021/OF022), reconstruimos esa
+        # familia desde top3 para que los rebates MT no dependan de otro archivo.
+        top3_required = {
+            "oferta_id", "nombre_oferta", "precio_mensual", "gb_incluidos"
+        }
+        if top3_required.issubset(self.top3.columns):
+            mt_cols = [
+                c for c in [
+                    "oferta_id", "nombre_oferta", "precio_mensual",
+                    "ahorro_pct", "gb_incluidos"
+                ] if c in self.top3.columns
+            ]
+            mt_fallback = self.top3[mt_cols].drop_duplicates("oferta_id").copy()
+            mt_fallback["tipo_oferta"] = "movistar_total"
+            mt_fallback["es_movistar_total"] = True
+            mt_fallback["segmento_objetivo"] = "ambos"
+
+            if self.catalogo.empty or "oferta_id" not in self.catalogo.columns:
+                self.catalogo = mt_fallback
+            else:
+                self.catalogo["oferta_id"] = self.catalogo["oferta_id"].astype(str)
+                existing_ids = set(self.catalogo["oferta_id"].astype(str))
+                missing_mt = mt_fallback[
+                    ~mt_fallback["oferta_id"].astype(str).isin(existing_ids)
+                ]
+                if not missing_mt.empty:
+                    self.catalogo = pd.concat(
+                        [self.catalogo, missing_mt], ignore_index=True, sort=False
+                    )
+
         if not self.catalogo.empty and "oferta_id" in self.catalogo.columns:
             self.catalogo["oferta_id"] = self.catalogo["oferta_id"].astype(str)
 
