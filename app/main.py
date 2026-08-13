@@ -270,3 +270,10 @@ def resumen_canales():
 @app.get("/api/v1/prioridades/resumen", tags=["Analytics"])
 def resumen_prioridades():
     return get_repository().summary_priorities()
+
+
+# FOCO Assistant se integra como router separado para no mezclar su lógica
+# conversacional con el motor NBO ni afectar el arranque ligero de Render.
+from .chatbot_api import router as chatbot_router
+
+app.include_router(chatbot_router)
