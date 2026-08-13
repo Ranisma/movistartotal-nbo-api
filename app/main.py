@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException, Query
+from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 
 from .config import (
@@ -21,12 +22,21 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
     allow_credentials=False,
-    allow_methods=["GET", "OPTIONS"],
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
 # Importante para Render: el repositorio NO se carga al importar el módulo.
 # Así Uvicorn puede abrir el puerto inmediatamente.
+
+
+class GestionComercialRequest(BaseModel):
+    evento: str
+    canal: str | None = None
+    motivo_rechazo: str | None = None
+    tipo_rebate: str | None = None
+    oferta_rebate_id: str | None = None
+    comentario: str | None = None
 
 
 @app.get("/", tags=["Sistema"])
@@ -149,6 +159,66 @@ def decision_cliente(cliente_id: str):
             detail="Cliente no encontrado en la base de clientes."
         )
     return result
+
+
+@app.get("/api/v1/clientes/{cliente_id}/rebates", tags=["Clientes"])
+def rebates_cliente(cliente_id: str):
+    decision = get_repository().get_client_decision(cliente_id)
+    if decision is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Cliente no encontrado en la base de clientes."
+        )
+    return {
+        "cliente_id": cliente_id,
+        "oferta_principal_id": decision.get("oferta_recomendada_id"),
+        "oferta_principal": decision.get("oferta_recomendada"),
+        "rebates": decision.get("rebates", {}),
+    }
+
+
+@app.get("/api/v1/clientes/{cliente_id}/gestiones", tags=["Trazabilidad"])
+def historial_gestiones_cliente(cliente_id: str):
+    decision = get_repository().get_client_decision(cliente_id)
+    if decision is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Cliente no encontrado en la base de clientes."
+        )
+    return {
+        "cliente_id": cliente_id,
+        "estado_actual": get_repository().get_estado_gestion(cliente_id),
+        "historial": get_repository().get_historial_gestion(cliente_id),
+    }
+
+
+@app.post("/api/v1/clientes/{cliente_id}/gestiones", tags=["Trazabilidad"])
+def registrar_gestion_cliente(cliente_id: str, payload: GestionComercialRequest):
+    try:
+        registro = get_repository().registrar_gestion(
+            cliente_id=cliente_id,
+            evento=payload.evento,
+            canal=payload.canal,
+            motivo_rechazo=payload.motivo_rechazo,
+            tipo_rebate=payload.tipo_rebate,
+            oferta_rebate_id=payload.oferta_rebate_id,
+            comentario=payload.comentario,
+        )
+    except ValueError as exc:
+        message = str(exc)
+        status_code = 404 if message.startswith("Cliente no encontrado") else 400
+        raise HTTPException(status_code=status_code, detail=message) from exc
+
+    return {
+        "ok": True,
+        "registro": registro,
+        "estado_actual": get_repository().get_estado_gestion(cliente_id),
+    }
+
+
+@app.get("/api/v1/gestiones/funnel", tags=["Trazabilidad"])
+def funnel_gestiones():
+    return get_repository().get_funnel_gestiones()
 
 
 @app.get("/api/v1/clientes/{cliente_id}", tags=["Clientes"])

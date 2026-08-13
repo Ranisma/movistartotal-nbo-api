@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from functools import lru_cache
+from threading import Lock
 from typing import Optional
+from uuid import uuid4
 
 import numpy as np
 import pandas as pd
@@ -24,6 +27,14 @@ def _clean_value(v):
 
 def _record_clean(record: dict) -> dict:
     return {k: _clean_value(v) for k, v in record.items()}
+
+
+def _clean_nested(value):
+    if isinstance(value, dict):
+        return {k: _clean_nested(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_clean_nested(v) for v in value]
+    return _clean_value(value)
 
 
 def _normalizar_rango_incremento(rango: Optional[str]) -> str:
@@ -62,6 +73,24 @@ class NBORepository:
 
         self.recomendaciones["cliente_id"] = self.recomendaciones["cliente_id"].astype(str)
         self.top3["cliente_id"] = self.top3["cliente_id"].astype(str)
+
+        # Catálogo: se usa para construir rebates consistentes con el portafolio real
+        # del desafío. Si el archivo no estuviera presente, el resto del motor sigue vivo.
+        catalogo_path = DATA_DIR / "catalogo_ofertas_entrega.csv"
+        self.catalogo = (
+            pd.read_csv(catalogo_path)
+            if catalogo_path.exists()
+            else pd.DataFrame()
+        )
+        if not self.catalogo.empty and "oferta_id" in self.catalogo.columns:
+            self.catalogo["oferta_id"] = self.catalogo["oferta_id"].astype(str)
+
+        # Trazabilidad funcional del prototipo. El archivo es append-only y permite
+        # reconstruir el recorrido oferta -> rechazo -> rebate -> resultado.
+        # Nota: en Render el filesystem puede ser efímero entre redeploys; para una
+        # implementación productiva esta misma interfaz debe apuntar a una BD.
+        self._gestiones_path = DATA_DIR / "gestiones_comerciales.jsonl"
+        self._gestiones_lock = Lock()
 
         # La capa universal (100k clientes) se carga SOLO cuando se consulta.
         self._decisiones = None
@@ -255,6 +284,339 @@ class NBORepository:
             for x in page[fields].to_dict(orient="records")
         ]
 
+    def _catalog_offer(self, oferta_id: Optional[str]) -> Optional[dict]:
+        if not oferta_id or self.catalogo.empty or "oferta_id" not in self.catalogo.columns:
+            return None
+        rows = self.catalogo[self.catalogo["oferta_id"].astype(str) == str(oferta_id)]
+        if rows.empty:
+            return None
+        return _record_clean(rows.iloc[0].to_dict())
+
+    @staticmethod
+    def _fit_for_usage(gb: Optional[float], consumo: Optional[float]) -> dict:
+        if gb is None or consumo is None:
+            return {
+                "adecuacion": "Sin historial",
+                "deficit_gb": None,
+                "margen_gb": None,
+            }
+        capacidad = float(gb)
+        uso = float(consumo)
+        if capacidad >= 9999:
+            return {"adecuacion": "Adecuado", "deficit_gb": 0.0, "margen_gb": None}
+        margen = round(capacidad - uso, 3)
+        if margen >= 0:
+            return {"adecuacion": "Adecuado", "deficit_gb": 0.0, "margen_gb": margen}
+        return {
+            "adecuacion": "Limitado",
+            "deficit_gb": round(abs(margen), 3),
+            "margen_gb": margen,
+        }
+
+    def _rebate_option_from_offer(
+        self,
+        row: pd.Series,
+        oferta: dict,
+        tipo: str,
+    ) -> dict:
+        oferta_id = str(oferta.get("oferta_id"))
+        nombre = oferta.get("nombre_oferta") or oferta_id
+        precio = float(oferta.get("precio_mensual") or 0)
+        gb = oferta.get("gb_incluidos")
+        gb = None if gb is None else float(gb)
+        total_actual = float(row.get("total_actual") or 0)
+        consumo = row.get("consumo_datos_gb_prom")
+        consumo = None if pd.isna(consumo) else float(consumo)
+
+        tipo_oferta = str(oferta.get("tipo_oferta") or "").lower()
+        es_mt = bool(oferta.get("es_movistar_total")) or tipo_oferta == "movistar_total"
+
+        if es_mt:
+            total_resultante = precio
+        elif tipo_oferta == "plan_movil":
+            hogar = row.get("hogar_actual_precio")
+            hogar = 0.0 if hogar is None or pd.isna(hogar) else float(hogar)
+            total_resultante = precio + hogar
+        else:
+            total_resultante = precio
+
+        total_resultante = round(total_resultante, 2)
+        variacion = round(total_resultante - total_actual, 2)
+        fit = self._fit_for_usage(gb, consumo)
+
+        if tipo == "precio":
+            if fit["adecuacion"] == "Limitado":
+                mensaje = (
+                    f"Esta alternativa reduce el precio, pero quedaría aproximadamente "
+                    f"{fit['deficit_gb']:.1f} GB/mes por debajo de tu consumo promedio."
+                )
+                speech = (
+                    f"Si prefieres priorizar el ahorro, podemos revisar {nombre}. "
+                    f"Pagarías S/{total_resultante:.2f} al mes. Ten en cuenta que su "
+                    f"capacidad quedaría aproximadamente {fit['deficit_gb']:.1f} GB por "
+                    "debajo de tu consumo habitual."
+                )
+            else:
+                mensaje = "Alternativa de menor precio que mantiene cobertura suficiente del consumo observado."
+                speech = (
+                    f"Si prefieres priorizar el ahorro, {nombre} es una alternativa de "
+                    f"S/{total_resultante:.2f} al mes y mantiene cobertura suficiente "
+                    "para tu consumo observado."
+                )
+        else:
+            mensaje = "Alternativa con mayor capacidad de datos para dar más holgura frente al consumo observado."
+            speech = (
+                f"Si prefieres tener más capacidad de datos, podemos revisar {nombre}. "
+                f"La opción quedaría en S/{total_resultante:.2f} al mes y te da mayor "
+                "holgura frente a tu consumo habitual."
+            )
+
+        return {
+            "tipo": tipo,
+            "titulo": "Prioriza pagar menos" if tipo == "precio" else "Prioriza más capacidad de datos",
+            "disponible": True,
+            "accion": "cambiar_oferta",
+            "oferta_id": oferta_id,
+            "oferta": nombre,
+            "precio": round(precio, 2),
+            "gb": gb,
+            "total_resultante": total_resultante,
+            "variacion_mensual": variacion,
+            "adecuacion": fit["adecuacion"],
+            "deficit_gb": fit["deficit_gb"],
+            "margen_gb": fit["margen_gb"],
+            "mensaje": mensaje,
+            "speech_sugerido": speech,
+        }
+
+    def get_rebate_options(self, cliente_id: str) -> dict:
+        """Devuelve dos caminos de rebate: precio y capacidad.
+
+        La elección NO intenta adivinar la preferencia del cliente. Se activa después
+        del rechazo, cuando el asesor identifica si prioriza pagar menos o disponer
+        de mayor capacidad de datos.
+        """
+        df = self._load_decisiones()
+        key = str(cliente_id)
+        if key not in df.index:
+            return {"precio": None, "capacidad": None}
+
+        row = df.loc[key]
+        if isinstance(row, pd.DataFrame):
+            row = row.iloc[0]
+
+        principal_id = row.get("oferta_recomendada_id")
+        if principal_id is None or pd.isna(principal_id):
+            return {"precio": None, "capacidad": None}
+        principal_id = str(principal_id)
+        principal = self._catalog_offer(principal_id)
+        if principal is None:
+            return {"precio": None, "capacidad": None}
+
+        tipo = str(principal.get("tipo_oferta") or "").lower()
+        es_mt = bool(principal.get("es_movistar_total")) or tipo == "movistar_total"
+
+        if self.catalogo.empty:
+            return {"precio": None, "capacidad": None}
+
+        if es_mt:
+            familia = self.catalogo[
+                self.catalogo.get("es_movistar_total", False).fillna(False).astype(bool)
+            ].copy()
+        elif tipo == "plan_movil":
+            familia = self.catalogo[
+                self.catalogo.get("tipo_oferta", "").astype(str).str.lower().eq("plan_movil")
+            ].copy()
+        else:
+            return {"precio": None, "capacidad": None}
+
+        if familia.empty:
+            return {"precio": None, "capacidad": None}
+
+        familia["precio_mensual"] = pd.to_numeric(familia["precio_mensual"], errors="coerce")
+        familia["gb_incluidos"] = pd.to_numeric(familia["gb_incluidos"], errors="coerce")
+        principal_precio = float(principal.get("precio_mensual") or 0)
+        principal_gb = float(principal.get("gb_incluidos") or 0)
+
+        cheaper = familia[familia["precio_mensual"] < principal_precio].sort_values(
+            "precio_mensual", ascending=False
+        )
+        if not cheaper.empty:
+            rebate_precio = self._rebate_option_from_offer(
+                row, _record_clean(cheaper.iloc[0].to_dict()), "precio"
+            )
+        else:
+            total_actual = round(float(row.get("total_actual") or 0), 2)
+            rebate_precio = {
+                "tipo": "precio",
+                "titulo": "Prioriza pagar menos",
+                "disponible": True,
+                "accion": "mantener_situacion_actual",
+                "oferta_id": None,
+                "oferta": "Mantener situación actual",
+                "precio": total_actual,
+                "gb": row.get("consumo_datos_gb_prom"),
+                "total_resultante": total_actual,
+                "variacion_mensual": 0.0,
+                "adecuacion": "Mantener",
+                "deficit_gb": None,
+                "margen_gb": None,
+                "mensaje": "La recomendación principal ya es la alternativa de menor precio de esta familia. Si el cliente prioriza pagar menos, se puede mantener su situación actual.",
+                "speech_sugerido": "Si hoy prefieres no aumentar tu pago, podemos mantener tus servicios actuales y dejar la alternativa recomendada para una próxima evaluación.",
+            }
+
+        if principal_gb >= 9999:
+            higher = familia.iloc[0:0]
+        else:
+            higher = familia[familia["gb_incluidos"] > principal_gb].sort_values(
+                ["gb_incluidos", "precio_mensual"], ascending=[True, True]
+            )
+
+        if not higher.empty:
+            rebate_capacidad = self._rebate_option_from_offer(
+                row, _record_clean(higher.iloc[0].to_dict()), "capacidad"
+            )
+        else:
+            rebate_capacidad = {
+                "tipo": "capacidad",
+                "titulo": "Prioriza más capacidad de datos",
+                "disponible": False,
+                "accion": "sin_alternativa_superior",
+                "oferta_id": principal_id,
+                "oferta": principal.get("nombre_oferta") or principal_id,
+                "precio": round(principal_precio, 2),
+                "gb": principal_gb,
+                "total_resultante": row.get("total_con_recomendacion"),
+                "variacion_mensual": row.get("variacion_mensual"),
+                "adecuacion": row.get("adecuacion"),
+                "deficit_gb": row.get("deficit_gb"),
+                "margen_gb": row.get("margen_gb"),
+                "mensaje": "La recomendación principal ya ofrece la máxima capacidad disponible dentro de esta familia de ofertas.",
+                "speech_sugerido": "La opción que te recomendé ya es la alternativa con mayor capacidad disponible, por lo que no necesitas subir a otro nivel para obtener más datos.",
+            }
+
+        return _clean_nested({"precio": rebate_precio, "capacidad": rebate_capacidad})
+
+    def _read_gestiones(self, cliente_id: Optional[str] = None) -> list[dict]:
+        if not self._gestiones_path.exists():
+            return []
+        rows: list[dict] = []
+        with self._gestiones_lock:
+            with open(self._gestiones_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        item = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if cliente_id is None or str(item.get("cliente_id")) == str(cliente_id):
+                        rows.append(item)
+        return rows
+
+    @staticmethod
+    def _estado_desde_evento(evento: Optional[str]) -> str:
+        mapping = {
+            "oferta_presentada": "Ofrecida",
+            "oferta_aceptada": "Aceptada",
+            "oferta_rechazada": "Rechazada",
+            "rebate_presentado": "Rebate ofrecido",
+            "rebate_aceptado": "Aceptada vía rebate",
+            "rebate_rechazado": "Rechazada definitiva",
+        }
+        return mapping.get(str(evento or "").lower(), "Pendiente")
+
+    def get_historial_gestion(self, cliente_id: str) -> list[dict]:
+        rows = self._read_gestiones(str(cliente_id))
+        return sorted(rows, key=lambda x: str(x.get("fecha_hora") or ""))
+
+    def get_estado_gestion(self, cliente_id: str) -> str:
+        rows = self.get_historial_gestion(cliente_id)
+        if not rows:
+            return "Pendiente"
+        return self._estado_desde_evento(rows[-1].get("evento"))
+
+    def registrar_gestion(
+        self,
+        cliente_id: str,
+        evento: str,
+        canal: Optional[str] = None,
+        motivo_rechazo: Optional[str] = None,
+        tipo_rebate: Optional[str] = None,
+        oferta_rebate_id: Optional[str] = None,
+        comentario: Optional[str] = None,
+    ) -> dict:
+        eventos_validos = {
+            "oferta_presentada",
+            "oferta_aceptada",
+            "oferta_rechazada",
+            "rebate_presentado",
+            "rebate_aceptado",
+            "rebate_rechazado",
+        }
+        evento = str(evento or "").strip().lower()
+        if evento not in eventos_validos:
+            raise ValueError(f"Evento no válido: {evento}")
+
+        df = self._load_decisiones()
+        key = str(cliente_id)
+        if key not in df.index:
+            raise ValueError(f"Cliente no encontrado: {key}")
+
+        if evento == "oferta_rechazada" and not str(motivo_rechazo or "").strip():
+            raise ValueError("El motivo_rechazo es obligatorio cuando la oferta es rechazada")
+
+        if evento.startswith("rebate_"):
+            tipo_rebate = str(tipo_rebate or "").strip().lower()
+            if tipo_rebate not in {"precio", "capacidad"}:
+                raise ValueError("tipo_rebate debe ser 'precio' o 'capacidad'")
+
+        row = df.loc[key]
+        if isinstance(row, pd.DataFrame):
+            row = row.iloc[0]
+
+        registro = {
+            "gestion_id": str(uuid4()),
+            "fecha_hora": datetime.now(timezone.utc).isoformat(),
+            "cliente_id": key,
+            "evento": evento,
+            "estado_resultante": self._estado_desde_evento(evento),
+            "oferta_principal_id": _clean_value(row.get("oferta_recomendada_id")),
+            "oferta_principal": _clean_value(row.get("oferta_recomendada")),
+            "canal": canal or _clean_value(row.get("canal_sugerido")),
+            "motivo_rechazo": str(motivo_rechazo).strip() if motivo_rechazo else None,
+            "tipo_rebate": tipo_rebate,
+            "oferta_rebate_id": oferta_rebate_id,
+            "comentario": str(comentario).strip() if comentario else None,
+        }
+
+        self._gestiones_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._gestiones_lock:
+            with open(self._gestiones_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(registro, ensure_ascii=False) + "\n")
+
+        return registro
+
+    def get_funnel_gestiones(self) -> dict:
+        rows = self._read_gestiones()
+        by_client: dict[str, set[str]] = {}
+        for row in rows:
+            cid = str(row.get("cliente_id"))
+            by_client.setdefault(cid, set()).add(str(row.get("evento")))
+
+        values = list(by_client.values())
+        return {
+            "priorizados": int(len(self.recomendaciones)),
+            "gestionados": len(values),
+            "ofrecidos": sum(1 for ev in values if ev & {"oferta_presentada", "oferta_aceptada", "oferta_rechazada", "rebate_presentado", "rebate_aceptado", "rebate_rechazado"}),
+            "aceptados_principal": sum(1 for ev in values if "oferta_aceptada" in ev),
+            "rechazados_principal": sum(1 for ev in values if "oferta_rechazada" in ev),
+            "con_rebate": sum(1 for ev in values if ev & {"rebate_presentado", "rebate_aceptado", "rebate_rechazado"}),
+            "aceptados_rebate": sum(1 for ev in values if "rebate_aceptado" in ev),
+            "rechazados_definitivos": sum(1 for ev in values if "rebate_rechazado" in ev),
+        }
+
     def get_client_decision(self, cliente_id: str) -> Optional[dict]:
         df = self._load_decisiones()
         key = str(cliente_id)
@@ -263,7 +625,14 @@ class NBORepository:
         row = df.loc[key]
         if isinstance(row, pd.DataFrame):
             row = row.iloc[0]
-        return _record_clean(row.to_dict())
+        decision = _record_clean(row.to_dict())
+        decision["rebates"] = self.get_rebate_options(key)
+        historial = self.get_historial_gestion(key)
+        decision["trazabilidad"] = {
+            "estado_actual": self.get_estado_gestion(key),
+            "historial": historial,
+        }
+        return _clean_nested(decision)
 
     def get_recommendation(self, cliente_id: str) -> Optional[dict]:
         rows = self.recomendaciones[self.recomendaciones["cliente_id"] == str(cliente_id)]

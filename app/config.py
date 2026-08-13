@@ -5,11 +5,12 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
 
 API_TITLE = "Movistar Total — NBO Intelligence API"
-API_VERSION = "1.7.0"
+API_VERSION = "1.8.0"
 API_DESCRIPTION = (
     "API pública para el motor Next Best Offer de Movistar Total y la capa "
     "Next Best Decision para consulta universal de clientes, elegibilidad MT, "
-    "prioridad comercial, top de oportunidades y búsqueda universal de clientes."
+    "prioridad comercial, rebates por precio/capacidad y trazabilidad del "
+    "ofrecimiento comercial."
 )
 
 
