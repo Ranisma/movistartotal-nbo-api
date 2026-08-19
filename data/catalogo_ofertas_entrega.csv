@@ -1,0 +1,8 @@
+oferta_id,nombre_oferta,tipo_oferta,precio_mensual,ahorro_pct,gb_incluidos,es_movistar_total,segmento_objetivo
+OF001,Plan Móvil Básico 10GB,plan_movil,39.90,0,10,false,ambos
+OF002,Plan Móvil Plus 25GB,plan_movil,59.90,0,25,false,ambos
+OF003,Plan Móvil Max 50GB,plan_movil,79.90,0,50,false,ambos
+OF004,Plan Móvil Ilimitado,plan_movil,99.90,0,9999,false,ambos
+OF020,Movistar Total Básico,movistar_total,129.90,10,100,true,ambos
+OF021,Movistar Total Plus,movistar_total,159.90,15,200,true,ambos
+OF022,Movistar Total Max,movistar_total,199.90,20,9999,true,ambos
