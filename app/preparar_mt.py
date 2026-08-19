@@ -6,6 +6,7 @@ import pandas as pd
 
 
 MOBILE_OFFER_TYPE = "plan_movil"
+MIN_PREPARATION_GB = 10.0
 
 
 def _bool_value(value) -> bool:
@@ -62,22 +63,17 @@ def _potential(row: pd.Series, consumption_gb: float) -> tuple[str, float, list[
     points = 0.0
     reasons: list[str] = []
 
-    # Necesidad observable: principal señal disponible para migración Prepago -> Postpago.
+    # La necesidad móvil es la señal principal. Los clientes por debajo de
+    # MIN_PREPARATION_GB no llegan a esta función porque no existe evidencia
+    # suficiente de necesidad para impulsar una migración Postpago.
     if consumption_gb >= 25:
         points += 45
         reasons.append(f"Consumo móvil alto: {consumption_gb:.1f} GB/mes")
-    elif consumption_gb >= 10:
+    else:
         points += 32
         reasons.append(f"Consumo móvil relevante: {consumption_gb:.1f} GB/mes")
-    elif consumption_gb >= 5:
-        points += 18
-        reasons.append(f"Consumo móvil moderado: {consumption_gb:.1f} GB/mes")
-    else:
-        points += 5
-        reasons.append(f"Consumo móvil bajo: {consumption_gb:.1f} GB/mes")
 
     acceptance = _number(row, "hist_tasa_aceptacion_previa", 0.0)
-    # Admite tasas almacenadas como 0..1 o 0..100.
     if acceptance > 1:
         acceptance /= 100.0
     if acceptance >= 0.5:
@@ -105,6 +101,8 @@ def _potential(row: pd.Series, consumption_gb: float) -> tuple[str, float, list[
     elif arrears > 0:
         points -= 5
 
+    # Primera versión: rechazo comercial agregado. No se presenta como rechazo
+    # específico de Postpago hasta disponer de la derivación por familia de oferta.
     rejections = _number(row, "hist_rechazos_previos", 0.0)
     previous_offers = _number(row, "hist_ofertas_previas", 0.0)
     if previous_offers > 0:
@@ -129,6 +127,9 @@ def build_preparation(row: pd.Series, catalog: pd.DataFrame) -> Optional[dict]:
         return None
 
     consumption = _number(row, "consumo_datos_gb_prom", 0.0)
+    if consumption < MIN_PREPARATION_GB:
+        return None
+
     offer = _recommend_offer(consumption, catalog)
     if offer is None:
         return None
