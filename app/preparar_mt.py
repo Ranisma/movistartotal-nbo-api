@@ -51,11 +51,15 @@ def _main_mobile_recommendation(row: pd.Series) -> Optional[dict]:
 
 @lru_cache(maxsize=1)
 def _load_preparation_context() -> dict[str, dict]:
-    path = DATA_DIR / "preparar_mt_contexto.csv.gz"
-    if not path.exists(): return {}
-    context = pd.read_csv(path)
-    if context.empty or "cliente_id" not in context.columns: return {}
+    paths = sorted(DATA_DIR.glob("preparar_mt_contexto_*.csv"))
+    if not paths:
+        return {}
+    frames = [pd.read_csv(path) for path in paths]
+    context = pd.concat(frames, ignore_index=True)
+    if context.empty or "cliente_id" not in context.columns:
+        return {}
     context["cliente_id"] = context["cliente_id"].astype(str)
+    context = context.drop_duplicates(subset=["cliente_id"], keep="last")
     return context.set_index("cliente_id").to_dict(orient="index")
 
 
