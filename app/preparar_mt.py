@@ -1,16 +1,58 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from threading import Lock
 from typing import Optional
 
 import pandas as pd
 
 from .config import DATA_DIR
+from .repository import NBORepository
 
 MOBILE_OFFER_TYPE = "plan_movil"
 MOBILE_OFFER_IDS = {"OF001", "OF002", "OF003", "OF004"}
 MIN_PREPARATION_GB = 10.0
 POTENTIAL_ORDER = {"Alto": 0, "Medio": 1, "Bajo": 2}
+
+# Render ejecuta endpoints sync de FastAPI en un thread pool. En un arranque frío,
+# varias consultas simultáneas podían entrar a NBORepository._load_decisiones()
+# antes de que la primera terminara y descomprimir varias veces el CSV universal
+# de 100k clientes. Ese DataFrame ocupa ~175 MB y el pico podía terminar en OOM/137.
+# Compartimos una única carga por proceso y serializamos únicamente el primer load.
+_DECISIONS_LOAD_LOCK = Lock()
+_SHARED_DECISIONS: Optional[pd.DataFrame] = None
+_ORIGINAL_LOAD_DECISIONES = NBORepository._load_decisiones
+
+
+def _load_decisiones_once(self: NBORepository) -> pd.DataFrame:
+    global _SHARED_DECISIONS
+
+    if self._decisiones is not None:
+        return self._decisiones
+
+    if _SHARED_DECISIONS is not None:
+        self._decisiones = _SHARED_DECISIONS
+        return self._decisiones
+
+    with _DECISIONS_LOAD_LOCK:
+        if _SHARED_DECISIONS is None:
+            _SHARED_DECISIONS = _ORIGINAL_LOAD_DECISIONES(self)
+        self._decisiones = _SHARED_DECISIONS
+
+    return self._decisiones
+
+
+# El parche se instala al importar este módulo, antes de aceptar tráfico HTTP.
+# No precarga el dataset: conserva el comportamiento lazy del backend.
+if NBORepository._load_decisiones is not _load_decisiones_once:
+    NBORepository._load_decisiones = _load_decisiones_once
+
+
+# La cola Preparar MT es determinista mientras vive el proceso. Se construye una sola
+# vez y luego filtros/paginación trabajan sobre 11,005 referencias, no sobre 100k filas.
+_PREPARATIONS_LOCK = Lock()
+_PREPARATIONS_CACHE: Optional[tuple[dict, ...]] = None
+_PREPARATIONS_BY_ID: Optional[dict[str, dict]] = None
 
 
 def _bool_value(value) -> bool:
@@ -22,13 +64,23 @@ def _bool_value(value) -> bool:
 
 
 def _number(value, default: float = 0.0) -> float:
-    parsed = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
-    return default if pd.isna(parsed) else float(parsed)
+    if value is None or pd.isna(value):
+        return default
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    return default if pd.isna(parsed) else parsed
 
 
 def _optional_number(value) -> Optional[float]:
-    parsed = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
-    return None if pd.isna(parsed) else float(parsed)
+    if value is None or pd.isna(value):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return None if pd.isna(parsed) else parsed
 
 
 def _text(value) -> str:
@@ -212,6 +264,64 @@ def build_preparation(
     }
 
 
+def _candidate_frame(decisions: pd.DataFrame) -> pd.DataFrame:
+    """Reduce el universo con operaciones vectorizadas antes de construir dicts."""
+    df = decisions.reset_index(drop=True)
+
+    tipo = df["tipo_cliente"].astype(str).str.lower()
+    hogar = df["tiene_internet_hogar"].fillna(False).astype(bool)
+    mt = df["es_movistar_total"].fillna(False).astype(bool)
+    consumo = pd.to_numeric(df["consumo_datos_gb_prom"], errors="coerce").fillna(0)
+    offer_type = df["tipo_oferta_recomendada"].astype(str).str.lower()
+    offer_id = df["oferta_recomendada_id"].astype(str)
+
+    mask = (
+        tipo.eq("prepago")
+        & hogar
+        & ~mt
+        & consumo.ge(MIN_PREPARATION_GB)
+        & offer_type.eq(MOBILE_OFFER_TYPE)
+        & offer_id.isin(MOBILE_OFFER_IDS)
+    )
+
+    if "adecuacion" in df.columns:
+        adequacy = df["adecuacion"].fillna("").astype(str).str.lower()
+        mask &= adequacy.eq("") | adequacy.eq("adecuado")
+
+    return df.loc[mask]
+
+
+def _all_preparations(
+    decisions: pd.DataFrame,
+    catalog: Optional[pd.DataFrame] = None,
+) -> tuple[dict, ...]:
+    global _PREPARATIONS_CACHE, _PREPARATIONS_BY_ID
+
+    if _PREPARATIONS_CACHE is not None:
+        return _PREPARATIONS_CACHE
+
+    with _PREPARATIONS_LOCK:
+        if _PREPARATIONS_CACHE is None:
+            rows: list[dict] = []
+            for _, row in _candidate_frame(decisions).iterrows():
+                item = build_preparation(row, catalog)
+                if item is not None:
+                    rows.append(item)
+
+            rows.sort(
+                key=lambda x: (
+                    POTENTIAL_ORDER[x["potencial"]],
+                    -float(x["consumo_datos_gb_prom"]),
+                    float(x.get("variacion_mensual") or 0),
+                    x["cliente_id"],
+                )
+            )
+            _PREPARATIONS_CACHE = tuple(rows)
+            _PREPARATIONS_BY_ID = {item["cliente_id"]: item for item in rows}
+
+    return _PREPARATIONS_CACHE
+
+
 def list_preparations(
     decisions: pd.DataFrame,
     catalog: Optional[pd.DataFrame] = None,
@@ -220,28 +330,22 @@ def list_preparations(
     potential: Optional[str] = None,
     search: Optional[str] = None,
 ) -> tuple[int, list[dict]]:
-    rows: list[dict] = []
+    rows = _all_preparations(decisions, catalog)
     q = str(search or "").strip().lower()
+    p = str(potential or "").strip().lower()
 
-    for _, row in decisions.reset_index(drop=True).iterrows():
-        if q and q not in str(row.get("cliente_id") or "").lower():
-            continue
-        item = build_preparation(row, catalog)
-        if item is None:
-            continue
-        if potential and item["potencial"].lower() != potential.strip().lower():
-            continue
-        rows.append(item)
+    if q or p:
+        filtered = [
+            item
+            for item in rows
+            if (not q or q in item["cliente_id"].lower())
+            and (not p or item["potencial"].lower() == p)
+        ]
+    else:
+        filtered = rows
 
-    rows.sort(
-        key=lambda x: (
-            POTENTIAL_ORDER[x["potencial"]],
-            -float(x["consumo_datos_gb_prom"]),
-            float(x.get("variacion_mensual") or 0),
-            x["cliente_id"],
-        )
-    )
-    return len(rows), rows[offset:offset + limit]
+    total = len(filtered)
+    return total, list(filtered[offset:offset + limit])
 
 
 def get_preparation(
@@ -249,10 +353,6 @@ def get_preparation(
     decisions: pd.DataFrame,
     catalog: Optional[pd.DataFrame] = None,
 ) -> Optional[dict]:
-    key = str(cliente_id)
-    if key not in decisions.index:
-        return None
-    row = decisions.loc[key]
-    if isinstance(row, pd.DataFrame):
-        row = row.iloc[0]
-    return build_preparation(row, catalog)
+    global _PREPARATIONS_BY_ID
+    _all_preparations(decisions, catalog)
+    return (_PREPARATIONS_BY_ID or {}).get(str(cliente_id))
