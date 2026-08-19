@@ -5,6 +5,7 @@ from app.preparar_mt import list_preparations
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA = ROOT / "data"
+EXPECTED = {"Alto": 4628, "Medio": 4213, "Bajo": 2164}
 
 
 def main():
@@ -22,7 +23,7 @@ def main():
         potential=None,
         search=None,
     )
-    assert total > 0, "No se detectaron candidatos Preparar para MT"
+    assert total == 11005, f"Universo Preparar MT inesperado: {total}"
 
     counts = {}
     for p in ["Alto", "Medio", "Bajo"]:
@@ -30,7 +31,8 @@ def main():
             decisiones, catalogo, limit=1, offset=0, potential=p, search=None
         )
         counts[p] = c
-    assert sum(counts.values()) == total, (counts, total)
+    assert counts == EXPECTED, f"Distribucion Preparar MT inesperada: {counts}"
+    assert sum(counts.values()) == total
 
     main_by_id = decisiones.set_index(decisiones["cliente_id"].astype(str), drop=False)
 
