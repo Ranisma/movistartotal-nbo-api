@@ -11,6 +11,7 @@ from .config import DATA_DIR
 MOBILE_OFFER_TYPE = "plan_movil"
 MOBILE_OFFER_IDS = {"OF001", "OF002", "OF003", "OF004"}
 MIN_PREPARATION_GB = 10.0
+POTENTIAL_ORDER = {"Alto": 0, "Medio": 1, "Bajo": 2}
 
 
 def _bool_value(value) -> bool:
@@ -26,10 +27,26 @@ def _number(value, default: float = 0.0) -> float:
     return default if pd.isna(parsed) else float(parsed)
 
 
+def _optional_number(value) -> Optional[float]:
+    parsed = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    return None if pd.isna(parsed) else float(parsed)
+
+
 def _text(value) -> str:
     if value is None or pd.isna(value):
         return ""
     return str(value).strip()
+
+
+def _optional_text(value) -> Optional[str]:
+    text = _text(value)
+    return text or None
+
+
+def _downgrade(level: str) -> str:
+    if level == "Alto":
+        return "Medio"
+    return "Bajo"
 
 
 def _is_candidate_base(row: pd.Series) -> bool:
@@ -41,11 +58,10 @@ def _is_candidate_base(row: pd.Series) -> bool:
 
 
 def _main_mobile_recommendation(row: pd.Series) -> Optional[dict]:
-    """Reutiliza la decisión móvil ya calculada en `decisiones_cliente.csv`.
+    """Reutiliza la recomendación móvil ya calculada en la capa de decisiones.
 
-    Preparar para MT no vuelve a decidir qué plan móvil corresponde. Esa decisión
-    pertenece al motor principal y aquí solo se reutiliza para priorizar la acción
-    Prepago -> Postpago.
+    Preparar para MT no vuelve a seleccionar el plan. Solo prioriza la acción
+    Prepago -> Postpago usando la decisión existente como oferta objetivo.
     """
     offer_id = _text(row.get("oferta_recomendada_id"))
     offer_type = _text(row.get("tipo_oferta_recomendada")).lower()
@@ -64,186 +80,128 @@ def _main_mobile_recommendation(row: pd.Series) -> Optional[dict]:
 
 
 @lru_cache(maxsize=1)
-def _load_mobile_history() -> dict[str, dict]:
-    """Deriva historial específico de planes móviles si el CSV está desplegado.
+def _load_preparation_context() -> dict[str, dict]:
+    """Carga el contexto histórico agregado usado solo por Preparar para MT.
 
-    El archivo no es obligatorio para mantener viva la API. Si no está presente,
-    Preparar para MT funciona con señales de la capa de decisiones y declara que el
-    historial específico todavía no está disponible.
+    El archivo se deriva del histórico de campañas del desafío. Contiene una fila
+    por candidato, no las 254k interacciones originales, y conserva únicamente las
+    señales necesarias: rechazo móvil, recencia, mora y reclamos.
     """
-    path = DATA_DIR / "dataset_nbo_entrenamiento.csv"
+    path = DATA_DIR / "preparar_mt_contexto.csv.gz"
     if not path.exists():
         return {}
 
-    history = pd.read_csv(path)
-    if history.empty or "cliente_id" not in history.columns:
+    context = pd.read_csv(path)
+    if context.empty or "cliente_id" not in context.columns:
         return {}
-
-    type_col = "tipo_oferta" if "tipo_oferta" in history.columns else "oferta_tipo"
-    if type_col not in history.columns:
-        return {}
-
-    mobile = history[
-        history[type_col].astype(str).str.lower().eq(MOBILE_OFFER_TYPE)
-    ].copy()
-    if mobile.empty:
-        return {}
-
-    mobile["cliente_id"] = mobile["cliente_id"].astype(str)
-    if "fecha" in mobile.columns:
-        mobile["_fecha"] = pd.to_datetime(mobile["fecha"], errors="coerce")
-        reference_date = mobile["_fecha"].max()
-    else:
-        mobile["_fecha"] = pd.NaT
-        reference_date = pd.NaT
-
-    result: dict[str, dict] = {}
-    for cliente_id, group in mobile.groupby("cliente_id", sort=False):
-        outcome = group.get("resultado", pd.Series("", index=group.index)).astype(str).str.lower()
-        accepted = int(outcome.eq("aceptada").sum())
-        rejected = int(outcome.eq("rechazada").sum())
-        total = int(len(group))
-
-        rejected_rows = group[outcome.eq("rechazada")].sort_values("_fecha")
-        last_rejection = rejected_rows.iloc[-1] if not rejected_rows.empty else None
-        last_reason = (
-            _text(last_rejection.get("motivo_rechazo")).lower()
-            if last_rejection is not None
-            else None
-        )
-        days_since_rejection = None
-        if (
-            last_rejection is not None
-            and pd.notna(reference_date)
-            and pd.notna(last_rejection.get("_fecha"))
-        ):
-            days_since_rejection = int((reference_date - last_rejection["_fecha"]).days)
-
-        latest = group.sort_values("_fecha").iloc[-1]
-        result[str(cliente_id)] = {
-            "ofertas_movil": total,
-            "aceptaciones_movil": accepted,
-            "rechazos_movil": rejected,
-            "tasa_aceptacion_movil": accepted / total if total else None,
-            "ultimo_motivo_rechazo_movil": last_reason,
-            "dias_desde_ultimo_rechazo_movil": days_since_rejection,
-            "n_reclamos": _number(latest.get("n_reclamos"), 0.0),
-            "dias_mora_prom": _number(latest.get("dias_mora_prom"), 0.0),
-        }
-    return result
+    context["cliente_id"] = context["cliente_id"].astype(str)
+    return context.set_index("cliente_id").to_dict(orient="index")
 
 
-def _potential(
+def _rejection_effect(
+    level: str,
+    context: dict,
+    target_offer_id: str,
+    reasons: list[str],
+) -> str:
+    """Aplica rechazo por recencia, familia y motivo; `mal_momento` no penaliza fit."""
+    context_target = _text(context.get("oferta_recomendada_id"))
+    same_days = _optional_number(context.get("dias_desde_rechazo_misma_oferta"))
+    same_reason = _text(context.get("motivo_rechazo_misma_oferta")).lower()
+
+    # La señal exacta solo es válida si el agregado corresponde a la oferta actual.
+    use_same = context_target == target_offer_id and same_days is not None and same_days <= 90
+    if use_same:
+        if same_days <= 30 and same_reason in {"no_necesita", "ya_tiene_similar"}:
+            reasons.append("Rechazó recientemente esta misma oferta por falta de necesidad o por contar con una alternativa similar")
+            return "Bajo"
+        if same_reason in {"no_necesita", "ya_tiene_similar", "no_confia", "precio", "otro"}:
+            reasons.append("Existe un rechazo reciente de la misma oferta móvil")
+            return _downgrade(level)
+        if same_reason == "mal_momento":
+            reasons.append("El rechazo de esta oferta fue por momento de contacto, no por falta de encaje")
+        return level
+
+    family_days = _optional_number(context.get("dias_desde_ultimo_rechazo_movil"))
+    family_reason = _text(context.get("ultimo_motivo_rechazo_movil")).lower()
+    if family_days is None or family_days > 90:
+        return level
+
+    if family_days <= 30 and family_reason in {"no_necesita", "ya_tiene_similar"}:
+        reasons.append("Existe un rechazo móvil muy reciente por falta de necesidad o por contar con una alternativa similar")
+        return "Bajo"
+    if family_reason in {"no_necesita", "ya_tiene_similar", "no_confia", "precio", "otro"}:
+        reasons.append("Existe un rechazo reciente dentro de la familia de planes móviles")
+        return _downgrade(level)
+    if family_reason == "mal_momento":
+        reasons.append("El último rechazo móvil fue por momento de contacto, por lo que no se penaliza el encaje de la oferta")
+    return level
+
+
+def _classify_potential(
     row: pd.Series,
     recommendation: dict,
-    mobile_history: Optional[dict],
-) -> tuple[str, float, list[str]]:
-    """Prioridad explicable dentro de Preparar para MT; no es Score MT ni ML."""
+    context: Optional[dict],
+) -> tuple[str, list[str]]:
+    """Clasificación explicable Alto/Medio/Bajo, sin construir un segundo score."""
     consumption = _number(row.get("consumo_datos_gb_prom"), 0.0)
-    points = 0.0
     reasons: list[str] = []
 
-    # 1) Necesidad móvil observable: señal principal.
-    if consumption >= 50:
-        points += 50
-        reasons.append(f"Consumo móvil muy alto: {consumption:.1f} GB/mes")
-    elif consumption >= 25:
-        points += 45
+    # Alto exige una necesidad móvil claramente observable; 10-25 GB parte en Medio.
+    if consumption >= 25:
+        level = "Alto"
         reasons.append(f"Consumo móvil alto: {consumption:.1f} GB/mes")
     else:
-        points += 35
+        level = "Medio"
         reasons.append(f"Consumo móvil relevante: {consumption:.1f} GB/mes")
 
-    # 2) La recomendación existente debe cubrir el consumo.
-    adequacy = _text(recommendation.get("adecuacion")).lower()
-    if adequacy == "adecuado":
-        points += 10
-        reasons.append("La recomendación móvil actual cubre el consumo observado")
-    elif adequacy:
-        points -= 15
-        reasons.append("La recomendación móvil actual requiere revisión de capacidad")
-
-    # 3) Viabilidad económica tomada de la misma decisión de main.
     variation = _number(recommendation.get("variacion_mensual"), 0.0)
-    if variation <= 0:
-        points += 12
+    if variation > 10:
+        level = _downgrade(level)
+        reasons.append(f"La migración estimada incrementa el gasto mensual en S/{variation:.2f}")
+    elif variation <= 0:
         reasons.append("La recomendación no incrementa el gasto mensual estimado")
-    elif variation <= 10:
-        points += 5
-        reasons.append("El incremento mensual estimado es acotado")
-    else:
-        points -= 5
-        reasons.append(f"La recomendación implica un incremento de S/{variation:.2f}/mes")
 
-    # 4) Relación con Movistar. No crea la oportunidad: solo ordena una necesidad ya observada.
-    tenure = _number(row.get("antiguedad_meses"), 0.0)
-    if tenure >= 24:
-        points += 8
-        reasons.append("Relación sostenida con Movistar")
-    elif tenure >= 12:
-        points += 5
+    if context:
+        level = _rejection_effect(
+            level,
+            context,
+            _text(recommendation.get("oferta_id")),
+            reasons,
+        )
 
-    # 5) Historial específico de planes móviles, solo si el archivo está disponible.
-    if mobile_history:
-        rate = mobile_history.get("tasa_aceptacion_movil")
-        if rate is not None and rate >= 0.5:
-            points += 10
-            reasons.append("Buena receptividad histórica a ofertas móviles")
-        elif rate is not None and rate >= 0.25:
-            points += 5
+        complaints = _optional_number(context.get("n_reclamos"))
+        if complaints is not None and complaints >= 3:
+            level = _downgrade(level)
+            reasons.append("La cantidad de reclamos reduce la prioridad comercial")
 
-        days = mobile_history.get("dias_desde_ultimo_rechazo_movil")
-        if days is not None:
-            if days <= 30:
-                points -= 15
-                reasons.append("Rechazo reciente de una oferta móvil")
-            elif days <= 90:
-                points -= 8
-                reasons.append("Rechazo móvil relativamente reciente")
-            else:
-                points -= 3
+        arrears = _optional_number(context.get("dias_mora_prom"))
+        if arrears is not None and arrears >= 15:
+            level = _downgrade(level)
+            reasons.append("La mora observada reduce la prioridad comercial")
 
-        reason = _text(mobile_history.get("ultimo_motivo_rechazo_movil")).lower()
-        reason_penalty = {
-            "no_necesita": 12,
-            "ya_tiene_similar": 10,
-            "no_confia": 7,
-            "precio": 5,
-            "mal_momento": 2,
-            "otro": 3,
-        }.get(reason, 0)
-        if reason_penalty:
-            points -= reason_penalty
-            reason_labels = {
-                "no_necesita": "El último rechazo móvil fue por falta de necesidad",
-                "ya_tiene_similar": "El último rechazo móvil indicó que ya tenía una alternativa similar",
-                "no_confia": "El último rechazo móvil estuvo asociado a confianza",
-                "precio": "El último rechazo móvil estuvo asociado al precio",
-                "mal_momento": "El último rechazo móvil fue por un mal momento de contacto",
-                "otro": "Existe un rechazo móvil previo a considerar",
-            }
-            reasons.append(reason_labels[reason])
+        acceptance_rate = _optional_number(context.get("tasa_aceptacion_movil"))
+        if acceptance_rate is not None and acceptance_rate >= 0.5:
+            reasons.append("Presenta buena receptividad histórica a ofertas móviles")
 
-        complaints = _number(mobile_history.get("n_reclamos"), 0.0)
-        if complaints >= 3:
-            points -= 8
-            reasons.append("Reclamos recientes reducen la prioridad comercial")
-        elif complaints >= 1:
-            points -= 3
+    return level, reasons
 
-        arrears = _number(mobile_history.get("dias_mora_prom"), 0.0)
-        if arrears >= 15:
-            points -= 10
-            reasons.append("Mora observada reduce la prioridad comercial")
-        elif arrears > 0:
-            points -= 4
 
-    points = max(0.0, min(100.0, points))
-    if points >= 70:
-        return "Alto", points, reasons
-    if points >= 50:
-        return "Medio", points, reasons
-    return "Bajo", points, reasons
+def _public_context(context: Optional[dict]) -> Optional[dict]:
+    if not context:
+        return None
+    return {
+        "ofertas_movil": _optional_number(context.get("ofertas_movil")),
+        "aceptaciones_movil": _optional_number(context.get("aceptaciones_movil")),
+        "rechazos_movil": _optional_number(context.get("rechazos_movil")),
+        "tasa_aceptacion_movil": _optional_number(context.get("tasa_aceptacion_movil")),
+        "ultimo_motivo_rechazo_movil": _optional_text(context.get("ultimo_motivo_rechazo_movil")),
+        "dias_desde_ultimo_rechazo_movil": _optional_number(context.get("dias_desde_ultimo_rechazo_movil")),
+        "dias_desde_rechazo_misma_oferta": _optional_number(context.get("dias_desde_rechazo_misma_oferta")),
+        "motivo_rechazo_misma_oferta": _optional_text(context.get("motivo_rechazo_misma_oferta")),
+        "n_reclamos": _optional_number(context.get("n_reclamos")),
+        "dias_mora_prom": _optional_number(context.get("dias_mora_prom")),
+    }
 
 
 def build_preparation(row: pd.Series, catalog: Optional[pd.DataFrame] = None) -> Optional[dict]:
@@ -258,8 +216,12 @@ def build_preparation(row: pd.Series, catalog: Optional[pd.DataFrame] = None) ->
     if recommendation is None:
         return None
 
-    history = _load_mobile_history().get(str(row.get("cliente_id")))
-    potential, internal_order, reasons = _potential(row, recommendation, history)
+    adequacy = _text(recommendation.get("adecuacion")).lower()
+    if adequacy and adequacy != "adecuado":
+        return None
+
+    context = _load_preparation_context().get(str(row.get("cliente_id")))
+    potential, reasons = _classify_potential(row, recommendation, context)
     reasons.insert(0, "Ya cuenta con Internet Hogar Movistar")
 
     gb = _number(recommendation.get("gb_incluidos"), 0.0)
@@ -270,8 +232,6 @@ def build_preparation(row: pd.Series, catalog: Optional[pd.DataFrame] = None) ->
         "estado": "Preparar para MT",
         "accion_recomendada": "Migrar a Postpago",
         "potencial": potential,
-        # Solo ordena esta cola; nunca se muestra ni se compara con Score NBO MT.
-        "_orden_preparacion": round(internal_order, 2),
         "oferta_recomendada_id": recommendation.get("oferta_id"),
         "oferta_recomendada": recommendation.get("nombre_oferta"),
         "precio_recomendado": recommendation.get("precio_mensual"),
@@ -281,8 +241,8 @@ def build_preparation(row: pd.Series, catalog: Optional[pd.DataFrame] = None) ->
         "variacion_mensual": recommendation.get("variacion_mensual"),
         "motivo_recomendacion": recommendation.get("motivo_recomendacion"),
         "canal_sugerido": row.get("canal_sugerido") or row.get("canal_mas_usado"),
-        "historial_movil_disponible": history is not None,
-        "historial_movil": history,
+        "historial_movil_disponible": bool(context and _optional_number(context.get("ofertas_movil")) is not None),
+        "contexto_comercial": _public_context(context),
         "razones": reasons,
         "ruta_mt": {
             "actual": "Prepago + Internet Hogar",
@@ -291,8 +251,8 @@ def build_preparation(row: pd.Series, catalog: Optional[pd.DataFrame] = None) ->
         },
         "mensaje_capacidad": f"El plan recomendado por el motor actual ofrece {capacity_text}.",
         "nota_metodologica": (
-            "Preparar para MT prioriza una acción previa a Movistar Total. "
-            "No recalcula la oferta móvil, no es una probabilidad ML y no modifica el Score NBO MT."
+            "El potencial es una clasificación explicable basada en necesidad, viabilidad económica, "
+            "fricción comercial y salud de la relación. No es Score MT ni una probabilidad ML."
         ),
     }
 
@@ -319,12 +279,16 @@ def list_preparations(
             continue
         rows.append(item)
 
-    rows.sort(key=lambda x: (-x["_orden_preparacion"], x["cliente_id"]))
+    rows.sort(
+        key=lambda x: (
+            POTENTIAL_ORDER[x["potencial"]],
+            -float(x["consumo_datos_gb_prom"]),
+            float(x.get("variacion_mensual") or 0.0),
+            x["cliente_id"],
+        )
+    )
     total = len(rows)
-    page = rows[offset: offset + limit]
-    for item in page:
-        item.pop("_orden_preparacion", None)
-    return total, page
+    return total, rows[offset: offset + limit]
 
 
 def get_preparation(
@@ -338,7 +302,4 @@ def get_preparation(
     row = decisions.loc[key]
     if isinstance(row, pd.DataFrame):
         row = row.iloc[0]
-    item = build_preparation(row, catalog)
-    if item is not None:
-        item.pop("_orden_preparacion", None)
-    return item
+    return build_preparation(row, catalog)
