@@ -10,6 +10,7 @@ from .config import (
 )
 from .repository import get_repository
 from .rebate_rules import normalizar_rebates_decision
+from .preparar_mt import get_preparation, list_preparations
 
 app = FastAPI(
     title=API_TITLE,
@@ -79,13 +80,7 @@ def listar_recomendaciones(
     sort_by: str = "score_nbo",
     descending: bool = True,
 ):
-    """Cola comercial Movistar Total.
-
-    Este endpoint se mantiene restringido al universo elegible MT.
-    `solo_incremento=true` activa el filtro económico. `rango_incremento`
-    admite: cualquiera, menos_10, desde_10, desde_20 o desde_40.
-    Por defecto usa desde_10.
-    """
+    """Cola comercial Movistar Total. Se mantiene restringida al universo elegible MT."""
     total, items = get_repository().list_recommendations(
         limit=limit,
         offset=offset,
@@ -110,6 +105,42 @@ def listar_recomendaciones(
     }
 
 
+@app.get("/api/v1/preparar-mt", tags=["Preparar para MT"])
+def listar_preparar_mt(
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    potencial: str | None = Query(None, pattern="^(Alto|Medio|Bajo)$"),
+    search: str | None = None,
+):
+    """Cola secundaria: Prepago + Internet Hogar con oportunidad de migración.
+
+    Esta cola NO altera ni compite con el Score NBO Movistar Total. El potencial
+    Alto/Medio/Bajo solo ordena candidatos dentro del módulo Preparar para MT.
+    """
+    repo = get_repository()
+    total, items = list_preparations(
+        decisions=repo._load_decisiones(),
+        catalog=repo.catalogo,
+        limit=limit,
+        offset=offset,
+        potential=potencial,
+        search=search,
+    )
+    return {"total": total, "limit": limit, "offset": offset, "items": items}
+
+
+@app.get("/api/v1/preparar-mt/{cliente_id}", tags=["Preparar para MT"])
+def detalle_preparar_mt(cliente_id: str):
+    repo = get_repository()
+    result = get_preparation(cliente_id, repo._load_decisiones(), repo.catalogo)
+    if result is None:
+        raise HTTPException(
+            status_code=404,
+            detail="El cliente no pertenece al universo Preparar para MT.",
+        )
+    return result
+
+
 @app.get("/api/v1/clientes-universo", tags=["Clientes"])
 def listar_clientes_universo(
     limit: int = Query(100, ge=1, le=500),
@@ -122,14 +153,7 @@ def listar_clientes_universo(
     sort_by: str = "score_nbo_mt",
     descending: bool = True,
 ):
-    """Vista Clientes: top comercial por defecto y búsqueda universal.
-
-    - Sin `search`: devuelve elegibles MT ordenados por Score NBO descendente.
-    - Sin `search` + `solo_incremento=true`: mismo ranking, refinado por
-      `rango_incremento` (cualquiera, menos_10, desde_10, desde_20, desde_40).
-    - Con `search`: busca en los 100k clientes, aunque no sean aptos MT o ya
-      tengan MT. En búsqueda, `solo_incremento` no bloquea la coincidencia.
-    """
+    """Vista Clientes: top comercial por defecto y búsqueda universal."""
     total, items = get_repository().list_client_decisions(
         limit=limit,
         offset=offset,
@@ -155,10 +179,7 @@ def listar_clientes_universo(
 def decision_cliente(cliente_id: str):
     result = get_repository().get_client_decision(cliente_id)
     if result is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Cliente no encontrado en la base de clientes."
-        )
+        raise HTTPException(status_code=404, detail="Cliente no encontrado en la base de clientes.")
     return normalizar_rebates_decision(result)
 
 
@@ -166,10 +187,7 @@ def decision_cliente(cliente_id: str):
 def rebates_cliente(cliente_id: str):
     decision = get_repository().get_client_decision(cliente_id)
     if decision is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Cliente no encontrado en la base de clientes."
-        )
+        raise HTTPException(status_code=404, detail="Cliente no encontrado en la base de clientes.")
     decision = normalizar_rebates_decision(decision)
     return {
         "cliente_id": cliente_id,
@@ -183,10 +201,7 @@ def rebates_cliente(cliente_id: str):
 def historial_gestiones_cliente(cliente_id: str):
     decision = get_repository().get_client_decision(cliente_id)
     if decision is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Cliente no encontrado en la base de clientes."
-        )
+        raise HTTPException(status_code=404, detail="Cliente no encontrado en la base de clientes.")
     return {
         "cliente_id": cliente_id,
         "estado_actual": get_repository().get_estado_gestion(cliente_id),
@@ -210,7 +225,6 @@ def registrar_gestion_cliente(cliente_id: str, payload: GestionComercialRequest)
         message = str(exc)
         status_code = 404 if message.startswith("Cliente no encontrado") else 400
         raise HTTPException(status_code=status_code, detail=message) from exc
-
     return {
         "ok": True,
         "registro": registro,
@@ -227,10 +241,7 @@ def funnel_gestiones():
 def cliente_360(cliente_id: str):
     result = get_repository().get_client360(cliente_id)
     if result is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Cliente no encontrado en el universo elegible MT."
-        )
+        raise HTTPException(status_code=404, detail="Cliente no encontrado en el universo elegible MT.")
     return result
 
 
@@ -238,10 +249,7 @@ def cliente_360(cliente_id: str):
 def recomendacion_cliente(cliente_id: str):
     result = get_repository().get_recommendation(cliente_id)
     if result is None:
-        raise HTTPException(
-            status_code=404,
-            detail="No existe recomendación NBO MT para este cliente."
-        )
+        raise HTTPException(status_code=404, detail="No existe recomendación NBO MT para este cliente.")
     return result
 
 
@@ -249,14 +257,8 @@ def recomendacion_cliente(cliente_id: str):
 def top3_cliente(cliente_id: str):
     result = get_repository().get_top3(cliente_id)
     if not result:
-        raise HTTPException(
-            status_code=404,
-            detail="No existen alternativas NBO MT para este cliente."
-        )
-    return {
-        "cliente_id": cliente_id,
-        "alternativas": result,
-    }
+        raise HTTPException(status_code=404, detail="No existen alternativas NBO MT para este cliente.")
+    return {"cliente_id": cliente_id, "alternativas": result}
 
 
 @app.get("/api/v1/ofertas/resumen", tags=["Analytics"])
