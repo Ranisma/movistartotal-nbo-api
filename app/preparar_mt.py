@@ -51,7 +51,7 @@ def _main_mobile_recommendation(row: pd.Series) -> Optional[dict]:
 
 @lru_cache(maxsize=1)
 def _load_preparation_context() -> dict[str, dict]:
-    path = DATA_DIR / "preparar_mt_contexto.csv"
+    path = DATA_DIR / "preparar_mt_contexto.csv.gz"
     if not path.exists(): return {}
     context = pd.read_csv(path)
     if context.empty or "cliente_id" not in context.columns: return {}
