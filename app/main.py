@@ -10,7 +10,7 @@ from .config import (
 )
 from .repository import get_repository
 from .rebate_rules import normalizar_rebates_decision
-from .preparar_mt import get_preparation, list_preparations
+from .preparar_mt import build_preparation, get_preparation, list_preparations
 
 app = FastAPI(
     title=API_TITLE,
@@ -39,6 +39,11 @@ class GestionComercialRequest(BaseModel):
     tipo_rebate: str | None = None
     oferta_rebate_id: str | None = None
     comentario: str | None = None
+
+
+def _pick(source: dict | None, fields: list[str]) -> dict:
+    source = source or {}
+    return {field: source.get(field) for field in fields if field in source}
 
 
 @app.get("/", tags=["Sistema"])
@@ -181,6 +186,155 @@ def decision_cliente(cliente_id: str):
     if result is None:
         raise HTTPException(status_code=404, detail="Cliente no encontrado en la base de clientes.")
     return normalizar_rebates_decision(result)
+
+
+@app.get("/api/v1/clientes/{cliente_id}/experiencia", tags=["Experiencia Cliente"])
+def contexto_experiencia_cliente(cliente_id: str):
+    """Contexto único y compacto para Next AI en Experiencia Cliente.
+
+    La intención del cliente la interpreta el LLM. El backend únicamente devuelve
+    datos y alternativas válidas: recomendación principal, rebate por precio,
+    rebate por capacidad y situación/ruta hacia Movistar Total.
+
+    Para comprobar Preparar para MT se evalúa únicamente la fila del cliente; este
+    endpoint no construye la cola completa de Preparar MT.
+    """
+    repo = get_repository()
+    key = str(cliente_id)
+
+    decision = repo.get_client_decision(key)
+    if decision is None:
+        raise HTTPException(status_code=404, detail="Cliente no encontrado en la base de clientes.")
+    decision = normalizar_rebates_decision(decision)
+
+    decisions = repo._load_decisiones()
+    row = decisions.loc[key]
+    if hasattr(row, "iloc") and getattr(row, "ndim", 1) > 1:
+        row = row.iloc[0]
+
+    preparation = build_preparation(row, repo.catalogo)
+    recommendation_mt = repo.get_recommendation(key)
+    top3_mt = repo.get_top3(key) if recommendation_mt is not None else []
+
+    es_mt = bool(decision.get("es_movistar_total"))
+    elegible_mt = bool(decision.get("elegible_mt"))
+
+    if es_mt:
+        estado_mt = "Ya tiene MT"
+    elif elegible_mt:
+        estado_mt = "Apto MT"
+    elif preparation is not None:
+        estado_mt = "Preparar para MT"
+    else:
+        estado_mt = "No apto MT"
+
+    perfil = _pick(
+        decision,
+        [
+            "cliente_id",
+            "tipo_cliente",
+            "antiguedad_meses",
+            "ubicacion_departamento",
+            "tiene_movil",
+            "tiene_hogar",
+            "tiene_internet_hogar",
+            "es_movistar_total",
+            "plan_actual_id",
+            "plan_actual_nombre",
+            "consumo_datos_gb_prom",
+            "monto_facturado_prom",
+            "total_actual",
+        ],
+    )
+
+    decision_comercial = _pick(
+        decision,
+        [
+            "decision_tipo",
+            "oferta_recomendada_id",
+            "oferta_recomendada",
+            "tipo_oferta_recomendada",
+            "precio_recomendado",
+            "gb_recomendados",
+            "total_con_recomendacion",
+            "variacion_mensual",
+            "adecuacion",
+            "margen_gb",
+            "deficit_gb",
+            "motivo_recomendacion",
+            "recomendacion_es_plan_actual",
+        ],
+    )
+
+    rebates = decision.get("rebates") or {}
+    pagar_menos = rebates.get("precio")
+    mas_datos = rebates.get("capacidad")
+
+    nbo_mt = None
+    if recommendation_mt is not None:
+        nbo_mt = {
+            "recomendacion": _pick(
+                recommendation_mt,
+                [
+                    "oferta_recomendada_id",
+                    "oferta_recomendada",
+                    "score_nbo",
+                    "prioridad",
+                    "canal_recomendado",
+                    "precio_recomendado",
+                    "motivo_recomendacion",
+                ],
+            ),
+            "top3": top3_mt,
+        }
+
+    if estado_mt == "Apto MT":
+        opcion_mt = {
+            "disponible": True,
+            "ruta": "oferta_directa",
+            "detalle": nbo_mt,
+        }
+    elif estado_mt == "Preparar para MT":
+        opcion_mt = {
+            "disponible": False,
+            "ruta": "preparar_para_mt",
+            "detalle": preparation,
+        }
+    elif estado_mt == "Ya tiene MT":
+        opcion_mt = {
+            "disponible": False,
+            "ruta": "ya_tiene_mt",
+            "detalle": "El cliente ya cuenta con Movistar Total.",
+        }
+    else:
+        opcion_mt = {
+            "disponible": False,
+            "ruta": "no_apto",
+            "detalle": decision.get("motivo_no_elegible_mt"),
+        }
+
+    return {
+        "cliente_id": key,
+        "perfil": perfil,
+        "situacion_mt": {
+            "estado": estado_mt,
+            "elegible_mt": elegible_mt,
+            "es_movistar_total": es_mt,
+            "preparar_para_mt": preparation is not None,
+            "motivo_no_elegible_mt": decision.get("motivo_no_elegible_mt"),
+        },
+        "decision_comercial": decision_comercial,
+        "opciones_por_intencion": {
+            "pagar_menos": pagar_menos,
+            "mas_datos": mas_datos,
+            "movistar_total": opcion_mt,
+        },
+        "nbo_mt": nbo_mt,
+        "nota": (
+            "Las opciones provienen del backend. La intención del cliente y la forma "
+            "de explicarlas corresponden a la capa conversacional."
+        ),
+    }
 
 
 @app.get("/api/v1/clientes/{cliente_id}/rebates", tags=["Clientes"])

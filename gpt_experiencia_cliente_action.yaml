@@ -1,0 +1,100 @@
+openapi: 3.1.0
+info:
+  title: Movistar Next - Experiencia Cliente API
+  description: >
+    API de solo lectura para Next AI. Entrega en una sola consulta el contexto
+    comercial validado de un cliente, incluyendo recomendación principal,
+    alternativas para pagar menos o tener más datos y su ruta hacia Movistar Total.
+  version: 1.0.0
+servers:
+  - url: https://movistar-total-nbo-api.onrender.com
+paths:
+  /api/v1/clientes/{cliente_id}/experiencia:
+    get:
+      operationId: getCustomerExperienceContext
+      summary: Obtiene el contexto comercial completo para conversar con un cliente.
+      description: >
+        Usa esta operación cuando la respuesta dependa de un cliente concreto.
+        Devuelve perfil resumido, situación frente a Movistar Total, recomendación
+        comercial y opciones validadas para las intenciones pagar menos y tener más datos.
+        Esta es la única Action necesaria para la experiencia conversacional del cliente.
+      parameters:
+        - name: cliente_id
+          in: path
+          required: true
+          description: Identificador del cliente, por ejemplo CLI000001.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Contexto de Experiencia Cliente.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  cliente_id:
+                    type: string
+                  perfil:
+                    type: object
+                    properties: {}
+                    additionalProperties: true
+                  situacion_mt:
+                    type: object
+                    properties:
+                      estado:
+                        type: string
+                      elegible_mt:
+                        type: boolean
+                      es_movistar_total:
+                        type: boolean
+                      preparar_para_mt:
+                        type: boolean
+                      motivo_no_elegible_mt:
+                        type:
+                          - string
+                          - "null"
+                    additionalProperties: true
+                  decision_comercial:
+                    type: object
+                    properties: {}
+                    additionalProperties: true
+                  opciones_por_intencion:
+                    type: object
+                    properties:
+                      pagar_menos:
+                        type:
+                          - object
+                          - "null"
+                        properties: {}
+                        additionalProperties: true
+                      mas_datos:
+                        type:
+                          - object
+                          - "null"
+                        properties: {}
+                        additionalProperties: true
+                      movistar_total:
+                        type: object
+                        properties: {}
+                        additionalProperties: true
+                    additionalProperties: true
+                  nbo_mt:
+                    type:
+                      - object
+                      - "null"
+                    properties: {}
+                    additionalProperties: true
+                  nota:
+                    type: string
+                additionalProperties: true
+        "404":
+          description: Cliente no encontrado.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  detail:
+                    type: string
+                additionalProperties: true
